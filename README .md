@@ -37,9 +37,9 @@ uv run bliss_lab.py --unit 1200 --code 5
 **Requirements:** Python 3.11+, network access to the BLISS server.
 
 ```
-uv add pandas requests python-dotenv openpyxl lxml
+uv add pandas requests python-dotenv openpyxl lxml --native-tls
 uv add xlrd            # only if BLISS ever returns legacy .xls
-uv add --dev ruff
+uv add --dev ruff --native-tls
 ```
 
 **Use from another project** — package it once, then add it as an editable dependency:

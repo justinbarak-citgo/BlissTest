@@ -1,9 +1,9 @@
 [project]
-name = "blisstest"
+name = "bliss-test"
 version = "0.1.0"
-description = "Add your description here"
+description = "This project allows for pulling down Bliss ad-hoc lab queries in a programmatic fashion for automation."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = [
     "openpyxl>=3.1.5",
     "pandas>=3.1.0",
