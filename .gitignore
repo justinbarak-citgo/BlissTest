@@ -12,5 +12,6 @@ wheels/
 .env
 
 _debug/
-.vscode/
+.vscode
 output/
+.ruff_cache
