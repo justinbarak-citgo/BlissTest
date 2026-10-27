@@ -1,6 +1,6 @@
 [project]
 name = "bliss"
-version = "0.2.2"
+version = "0.2.3"
 description = "This project allows for pulling down Bliss ad-hoc lab queries in a programmatic fashion for automation."
 readme = "README.md"
 requires-python = ">=3.13"
