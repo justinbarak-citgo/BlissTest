@@ -12,5 +12,5 @@ wheels/
 .env
 
 _debug/
-
+.vscode/
 output/

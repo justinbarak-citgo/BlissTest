@@ -3,7 +3,7 @@ BLISS lab ad-hoc query -> pandas DataFrame.
 
 Library use
 -----------
-    from bliss_lab import BlissClient, pull
+    from bliss import BlissClient, pull
 
     # One-shot: login, pull, close
     df = pull()                                   # last 7 days through today
@@ -21,9 +21,10 @@ Library use
 
 CLI
 ---
-    uv run bliss_lab.py
-    uv run bliss_lab.py --start 2026-10-01 --end 2026-10-15 --debug
-    uv run bliss_lab.py --endpoint http://otherlab01
+    uv run bliss-pull
+    uv run bliss-pull --start 2026-10-01 --end 2026-10-15 --debug
+    uv run bliss-pull --endpoint http://otherlab01
+    uv run bliss-pull --save               # also save the raw file to ./output
 
 Flow (reverse-engineered from the browser capture)
 --------------------------------------------------
@@ -39,7 +40,10 @@ Endpoint: endpoint= accepts a name from ENDPOINTS, a URL, or a BlissEndpoint.
 Default is $BLISS_HOST if set, otherwise ENDPOINTS[DEFAULT_ENDPOINT] (ccrlab05).
 
 Credentials: pass user=/password=, or set BLISS_USER / BLISS_PASSWORD in the
-environment or a .env file (next to this module, or in the working directory).
+environment or a .env file. Lookup order (first value found wins):
+  1. real environment variables
+  2. .env in the calling project (searched upward from the working directory)
+  3. .env next to this module (fallback)
 """
 
 from __future__ import annotations
@@ -56,6 +60,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from functools import cache
 from html.parser import HTMLParser
 from pathlib import Path
 from types import TracebackType
@@ -73,6 +78,7 @@ __all__ = [
     "BlissEndpoint",
     "BlissError",
     "get_endpoint",
+    "main",
     "pull",
     "resolve_dates",
 ]
@@ -109,7 +115,7 @@ class BlissEndpoint:
         return self.host + self.login_path
 
 
-# Known BLISS instances. Add more here when needed; key = short name.
+# Known BLISS instances. Add more here when needed; key = short name (lowercase).
 ENDPOINTS: dict[str, BlissEndpoint] = {
     "ccrlab05": BlissEndpoint("http://ccrlab05", name="ccrlab05"),
 }
@@ -207,12 +213,15 @@ class _SessionExpired(BlissError):
 
 
 # ----------------------------------------------------------------------------- helpers
+@cache
 def _load_env() -> None:
-    """Load .env next to this module, then one found from the working dir.
-    Existing environment variables are never overwritten."""
-    load_dotenv(Path(__file__).with_name(".env"))
+    """Load .env files once per process. Existing variables are never
+    overwritten, so the first file loaded wins:
+      1. .env in the calling project (searched upward from the working dir)
+      2. .env next to this module (fallback)"""
     if found := find_dotenv(usecwd=True):
         load_dotenv(found)
+    load_dotenv(Path(__file__).with_name(".env"))
 
 
 def _to_date(d: DateLike) -> date:
@@ -327,24 +336,18 @@ class _Inputs(HTMLParser):
                 self.fields[a["name"]] = a.get("value") or ""
 
 
-def _is_done(xml_text: str) -> bool:
-    """Parse BLISS <Status> XML. True = finished, False = still running."""
+def _parse_status(xml_text: str) -> dict[str, str]:
+    """Parse BLISS <Status> XML into {tag: text}."""
     try:
         root = ET.fromstring(xml_text.strip())
     except ET.ParseError as e:
         raise BlissError(f"Unreadable status reply:\n{xml_text[:500]}") from e
-
-    def flag(tag: str) -> bool:
-        return (root.findtext(tag) or "").strip().lower() == "true"
-
-    if flag("isError"):
-        raise BlissError(f"BLISS export failed:\n{xml_text[:500]}")
-    return flag("isComplete")
+    return {child.tag: (child.text or "").strip() for child in root}
 
 
 def _to_frame(data: bytes, ext: str, sheet: int | str) -> pd.DataFrame:
     buf = io.BytesIO(data)
-    if ext == ".html.xls":  # HTML table dressed up as Excel
+    if ext == ".html.xls":  # HTML table dressed up as Excel (needs lxml)
         tables = pd.read_html(buf)
         if not tables:
             raise BlissError("Results page had no tables.")
@@ -378,6 +381,7 @@ class BlissClient:
         self.debug_dir: Path = Path(debug_dir) if debug_dir else Path.cwd() / "_debug"
         self.poll_seconds: float = poll_seconds
         self.timeout_seconds: float = timeout_seconds
+        self.last_status: dict[str, str] = {}
         self._s: requests.Session | None = None
         self._n: int = 0  # query counter, keeps debug dumps from overwriting
 
@@ -429,16 +433,16 @@ class BlissClient:
     ) -> pd.DataFrame:
         """Run one BLISS ad-hoc export and return it as a DataFrame.
 
-        start / end   date, datetime, or string ("2026-10-01"). End is inclusive.
-                      Defaults: end = today, start = end - days_back.
-        days_back     only used when start is None (default 7).
-        unit          BLISS Unit id (default "1000").
-        code          BLISS Code id (default "0").
-        attributes    list of ids [11, 2, 6] or dotted string "11.2.6".
+        start / end     date, datetime, or string ("2026-10-01"). End is inclusive.
+                        Defaults: end = today, start = end - days_back.
+        days_back       only used when start is None (default 7).
+        unit            BLISS Unit id (default "1000").
+        code            BLISS Code id (default "0").
+        attributes      list of ids [11, 2, 6] or dotted string "11.2.6".
         key_attributes  same format as attributes.
-        extra_params  any other raw BLISS query params, e.g. {"Lab": "3"}.
-        sheet         sheet index or name to return (default first sheet).
-        save_to       folder to also save the raw file into (optional).
+        extra_params    any other raw BLISS query params, e.g. {"Lab": "3"}.
+        sheet           sheet index or name to return (default first sheet).
+        save_to         folder to also save the raw file into (optional).
         """
         self.open()  # lazy login if needed
         start_d, end_d = resolve_dates(start, end, days_back)
@@ -465,15 +469,25 @@ class BlissClient:
             self.open()
             self._submit(qs, tag)
 
-        self._wait(tag)
+        self.last_status = self._wait(tag)
+        pages = int(self.last_status.get("totalPages") or 1)
+        if pages > 1:
+            log.warning(
+                "BLISS %s: %s pages (%s samples) - only page 1 was downloaded. "
+                "Narrow the date range.",
+                tag,
+                pages,
+                self.last_status.get("sampleCount"),
+            )
+
         data, ext = self._fetch(tag)
 
         if save_to is not None:
             out = Path(save_to)
             out.mkdir(parents=True, exist_ok=True)
-            path = (
-                out
-                / f"BLISS_{self.endpoint.name}_{start_d:%Y%m%d}_{end_d:%Y%m%d}_{datetime.now():%H%M%S}{ext}"
+            path = out / (
+                f"BLISS_{self.endpoint.name}_{start_d:%Y%m%d}_{end_d:%Y%m%d}"
+                f"_{datetime.now():%H%M%S}{ext}"
             )
             path.write_bytes(data)
             log.info("Saved %s bytes -> %s", f"{len(data):,}", path)
@@ -505,7 +519,8 @@ class BlissClient:
     def _login(self) -> requests.Session:
         if not self.user or not self._password:
             raise BlissError(
-                "BLISS_USER / BLISS_PASSWORD missing - pass user=/password= or set them in .env."
+                "BLISS_USER / BLISS_PASSWORD missing - pass user=/password= "
+                "or set them in .env."
             )
         s = requests.Session()
         s.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
@@ -519,6 +534,7 @@ class BlissClient:
             s.close()
             raise BlissError("Token64 not found on login page - page layout changed?")
         token64 = m.group(1)
+
         p = _Inputs()
         p.feed(r.text)
         form = p.fields
@@ -557,7 +573,6 @@ class BlissClient:
                 else "unknown reason"
             )
             raise BlissError(f"Login rejected: {reason}")
-
         log.info("Logged in to BLISS %s as %s", self.endpoint.name, self.user)
         return s
 
@@ -577,26 +592,29 @@ class BlissClient:
                 f"Expected redirect to excel.aspx?wait=true, landed on {r.url}"
             )
 
-    def _wait(self, tag: str) -> None:
+    def _wait(self, tag: str) -> dict[str, str]:
         url = urljoin(self.base, "excel.aspx?getstatus=1")
         hdrs = {
             "Accept": "application/xml, text/xml, */*; q=0.01",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": urljoin(self.base, "excel.aspx?wait=true"),
         }
-        t0, n, last = time.time(), 0, None
-        while time.time() - t0 < self.timeout_seconds:
+        t0, n, last = time.monotonic(), 0, None
+        while time.monotonic() - t0 < self.timeout_seconds:
             r = self._session.get(url, headers=hdrs, timeout=REQUEST_TIMEOUT)
             n += 1
             self._dump(f"{tag}_2_status_{n:03d}", r)
             r.raise_for_status()
-            if r.text != last:
-                log.debug("[%s status %d] %s", tag, n, r.text.strip()[:200])
-                last = r.text
-            if _is_done(r.text):
-                return
+            st = _parse_status(r.text)
+            if st.get("progress") != last:
+                log.debug("[%s] progress %s", tag, st.get("progress"))
+                last = st.get("progress")
+            if st.get("isError", "").lower() == "true":
+                raise BlissError(f"BLISS export failed:\n{r.text[:500]}")
+            if st.get("isComplete", "").lower() == "true":
+                return st
             time.sleep(self.poll_seconds)
-        raise BlissError(f"Job not finished after {self.timeout_seconds}s")
+        raise BlissError(f"Job not finished after {self.timeout_seconds:.0f}s")
 
     def _fetch(
         self, tag: str, url: str | None = None, depth: int = 0
@@ -660,8 +678,8 @@ def pull(
 
 
 # ----------------------------------------------------------------------------- CLI
-def _main() -> None:
-    ap = argparse.ArgumentParser(description="Pull BLISS lab data.")
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="bliss-pull", description="Pull BLISS lab data.")
     ap.add_argument(
         "--endpoint",
         default=None,
@@ -674,12 +692,14 @@ def _main() -> None:
     ap.add_argument("--code", help=f"BLISS Code id (default {BASE_PARAMS['Code']})")
     ap.add_argument(
         "--save",
-        default=str(Path(__file__).resolve().parent / "output"),
-        help="folder for the raw file",
+        nargs="?",
+        const="output",
+        default=None,
+        metavar="FOLDER",
+        help="also save the raw file (default: don't save; --save alone uses ./output)",
     )
-    ap.add_argument("--no-save", action="store_true")
     ap.add_argument(
-        "--debug", action="store_true", help="dump every response to _debug/"
+        "--debug", action="store_true", help="dump every response to ./_debug/"
     )
     a = ap.parse_args()
 
@@ -695,11 +715,11 @@ def _main() -> None:
         code=a.code,
         endpoint=a.endpoint,
         debug=a.debug,
-        save_to=None if a.no_save else a.save,
+        save_to=a.save,
     )
     print(df.shape)
     print(df.head())
 
 
 if __name__ == "__main__":
-    _main()
+    main()
