@@ -64,7 +64,7 @@ from functools import cache
 from html.parser import HTMLParser
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Final, TypeAlias
+from typing import Any, Final, Self
 from urllib.parse import urlencode, urljoin, urlsplit
 
 import pandas as pd
@@ -121,7 +121,7 @@ ENDPOINTS: dict[str, BlissEndpoint] = {
 }
 DEFAULT_ENDPOINT: str = "ccrlab05"
 
-EndpointLike: TypeAlias = BlissEndpoint | str | None
+type EndpointLike = BlissEndpoint | str | None
 
 
 def get_endpoint(endpoint: EndpointLike = None) -> BlissEndpoint:
@@ -200,8 +200,8 @@ BASE_PARAMS: Final[dict[str, str]] = {
 XLSX_MAGIC: Final = b"PK\x03\x04"  # .xlsx (zip)
 XLS_MAGIC: Final = b"\xd0\xcf\x11\xe0"  # legacy .xls (OLE)
 
-DateLike: TypeAlias = date | datetime | str | pd.Timestamp
-AttrList: TypeAlias = str | int | Iterable[int | str]
+type DateLike = date | datetime | str | pd.Timestamp
+type AttrList = str | int | Iterable[int | str]
 
 
 class BlissError(RuntimeError):
@@ -386,7 +386,7 @@ class BlissClient:
         self._n: int = 0  # query counter, keeps debug dumps from overwriting
 
     # -- lifecycle -------------------------------------------------------------
-    def __enter__(self) -> BlissClient:
+    def __enter__(self) -> Self:
         return self.open()
 
     def __exit__(
@@ -405,7 +405,7 @@ class BlissClient:
     def is_open(self) -> bool:
         return self._s is not None
 
-    def open(self) -> BlissClient:
+    def open(self) -> Self:
         if self._s is None:
             self._s = self._login()
         return self

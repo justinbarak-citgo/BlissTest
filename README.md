@@ -9,13 +9,13 @@ Log in once, run as many queries as you need, close. Default window is the **las
 ```python
 from bliss import BlissClient, pull
 
-df = pull()                                   # last 7 days, default endpoint
-df = pull("2026-10-01", "2026-10-15")         # explicit range (end is inclusive)
+df = pull()  # last 7 days, default endpoint
+df = pull("2026-10-01", "2026-10-15")  # explicit range (end is inclusive)
 
-with BlissClient() as bliss:                  # one login, many pulls
-    wk  = bliss.query()
+with BlissClient() as bliss:  # one login, many pulls
+    wk = bliss.query()
     sep = bliss.query(start="2026-09-01", end="2026-09-30")
-    mo  = bliss.query(days_back=30, attributes=[11, 2, 6])
+    mo = bliss.query(days_back=30, attributes=[11, 2, 6])
     alt = bliss.query(unit=1200, code=5)
 ```
 
@@ -63,7 +63,7 @@ uv add --editable C:\dev\bliss
 Or from a Git repo, pinned to a release tag:
 
 ```powershell
-uv add "bliss @ git+https://github.com/<org>/bliss.git@v0.2.2"
+uv add "bliss @ git+https://github.com/<org>/bliss.git@v0.2.3"
 ```
 
 Optional: if BLISS ever returns legacy `.xls` or an HTML table instead of `.xlsx`:
@@ -104,7 +104,7 @@ Add a permanent endpoint in `src/bliss/client.py`:
 ```python
 ENDPOINTS: dict[str, BlissEndpoint] = {
     "ccrlab05": BlissEndpoint("http://ccrlab05", name="ccrlab05"),
-    "lclab01":  BlissEndpoint("http://lclab01", name="lclab01"),
+    "lclab01": BlissEndpoint("http://lclab01", name="lclab01"),
 }
 ```
 
@@ -113,9 +113,12 @@ Non-standard install paths:
 ```python
 from bliss import BlissEndpoint, pull
 
-ep = BlissEndpoint("http://server", name="custom",
-                   base_path="/LIMS/Query/Adhoc.NET/",
-                   login_path="/LIMS/Pages/Security/Login.aspx")
+ep = BlissEndpoint(
+    "http://server",
+    name="custom",
+    base_path="/LIMS/Query/Adhoc.NET/",
+    login_path="/LIMS/Pages/Security/Login.aspx",
+)
 df = pull(endpoint=ep)
 ```
 
