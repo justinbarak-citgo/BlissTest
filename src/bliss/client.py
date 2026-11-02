@@ -255,9 +255,9 @@ def _to_date(d: DateLike) -> date:
         ts = pd.Timestamp(d)
     except (ValueError, TypeError) as e:
         raise ValueError(f"Can't parse date: {d!r}") from e
-    if not isinstance(ts, pd.Timestamp):  # NaT, e.g. from "" or "NaT"
-        raise ValueError(f"Can't parse date: {d!r}")
-    return ts.date()
+    if isinstance(ts, pd.Timestamp):
+        return ts.date()
+    raise ValueError(f"Can't parse date: {d!r}")  # NaT, e.g. from "" or "NaT"
 
 
 def resolve_dates(
