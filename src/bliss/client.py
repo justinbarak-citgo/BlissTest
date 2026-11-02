@@ -87,9 +87,19 @@ log: Final = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------------- endpoints
+
+
 @dataclass(frozen=True, slots=True)
 class BlissEndpoint:
-    """Where a BLISS instance lives. Paths are the stock BLISS layout."""
+    """Where a BLISS instance lives. Paths default to the stock BLISS layout.
+
+    Args:
+        host: Server name or URL, e.g. ``"ccrlab05"`` or ``"http://ccrlab05"``.
+            ``http://`` is added if no scheme is given.
+        name: Short label used in logs and file names. Default: the hostname.
+        base_path: Path to the Adhoc.NET query pages.
+        login_path: Path to the login page.
+    """
 
     host: str
     name: str = ""
@@ -108,10 +118,12 @@ class BlissEndpoint:
 
     @property
     def base_url(self) -> str:
+        """Full URL of the Adhoc.NET query folder."""
         return self.host + self.base_path
 
     @property
     def login_url(self) -> str:
+        """Full URL of the login page."""
         return self.host + self.login_path
 
 
@@ -125,12 +137,20 @@ type EndpointLike = BlissEndpoint | str | None
 
 
 def get_endpoint(endpoint: EndpointLike = None) -> BlissEndpoint:
-    """Resolve an endpoint.
+    """Resolve an endpoint name, URL, or object to a ``BlissEndpoint``.
 
-    None            -> $BLISS_HOST if set, else ENDPOINTS[DEFAULT_ENDPOINT]
-    BlissEndpoint   -> used as-is
-    "ccrlab05"      -> looked up in ENDPOINTS
-    "http://host"   -> ad-hoc endpoint with the standard BLISS paths
+    Args:
+        endpoint:
+            - ``None``: ``$BLISS_HOST`` if set, else ``ENDPOINTS[DEFAULT_ENDPOINT]``
+            - ``BlissEndpoint``: used as-is
+            - ``"ccrlab05"``: looked up in ``ENDPOINTS``
+            - ``"http://host"``: ad-hoc endpoint with the standard BLISS paths
+
+    Returns:
+        The resolved endpoint.
+
+    Raises:
+        ValueError: Name is not in ``ENDPOINTS`` and doesn't look like a URL.
     """
     if isinstance(endpoint, BlissEndpoint):
         return endpoint
@@ -153,7 +173,6 @@ POLL_SECONDS: Final = 2.0
 TIMEOUT_SECONDS: Final = 300.0
 REQUEST_TIMEOUT: Final = 60.0
 RESULTS_TIMEOUT: Final = 300.0
-
 UA: Final = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0"
@@ -205,7 +224,7 @@ type AttrList = str | int | Iterable[int | str]
 
 
 class BlissError(RuntimeError):
-    pass
+    """Login, query, polling, or download against BLISS failed."""
 
 
 class _SessionExpired(BlissError):
@@ -213,6 +232,8 @@ class _SessionExpired(BlissError):
 
 
 # ----------------------------------------------------------------------------- helpers
+
+
 @cache
 def _load_env() -> None:
     """Load .env files once per process. Existing variables are never
@@ -231,9 +252,12 @@ def _to_date(d: DateLike) -> date:
     if isinstance(d, date):
         return d
     try:
-        return pd.Timestamp(d).date()
+        ts = pd.Timestamp(d)
     except (ValueError, TypeError) as e:
         raise ValueError(f"Can't parse date: {d!r}") from e
+    if not isinstance(ts, pd.Timestamp):  # NaT, e.g. from "" or "NaT"
+        raise ValueError(f"Can't parse date: {d!r}")
+    return ts.date()
 
 
 def resolve_dates(
@@ -241,7 +265,19 @@ def resolve_dates(
     end: DateLike | None,
     days_back: int = DEFAULT_DAYS_BACK,
 ) -> tuple[date, date]:
-    """Defaults: end = today, start = end - days_back. End is inclusive."""
+    """Turn optional start/end inputs into a concrete (start, end) date pair.
+
+    Args:
+        start: First day. Default: ``end - days_back``.
+        end: Last day, inclusive. Default: today.
+        days_back: Only used when ``start`` is None.
+
+    Returns:
+        ``(start, end)`` as ``datetime.date``.
+
+    Raises:
+        ValueError: A date can't be parsed, or start is after end.
+    """
     end_d = _to_date(end) if end is not None else date.today()
     start_d = (
         _to_date(start) if start is not None else end_d - timedelta(days=days_back)
@@ -271,6 +307,7 @@ def build_params(
     key_attributes: AttrList | None = None,
     extra_params: Mapping[str, Any] | None = None,
 ) -> dict[str, str]:
+    """Build the excel.aspx query string params from ``BASE_PARAMS`` + overrides."""
     p = dict(BASE_PARAMS)
     p["StartDate"] = _fmt(start)
     p["EndDate"] = _fmt(end + timedelta(days=1))  # BLISS end is exclusive at midnight
@@ -291,7 +328,7 @@ def build_params(
 
 
 def _looks_like_login(resp: requests.Response) -> bool:
-    url = resp.url.lower()
+    url = (resp.url or "").lower()
     body = (
         resp.text[:5000].lower()
         if "text" in resp.headers.get("Content-Type", "")
@@ -332,8 +369,9 @@ class _Inputs(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "input":
             a = dict(attrs)
-            if a.get("name"):
-                self.fields[a["name"]] = a.get("value") or ""
+            name = a.get("name")
+            if name:
+                self.fields[name] = a.get("value") or ""
 
 
 def _parse_status(xml_text: str) -> dict[str, str]:
@@ -345,19 +383,45 @@ def _parse_status(xml_text: str) -> dict[str, str]:
     return {child.tag: (child.text or "").strip() for child in root}
 
 
+def _decode(data: bytes) -> str:
+    """Bytes -> text for HTML results. UTF-8 first, then Windows-1252."""
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1")  # never fails
+
+
 def _to_frame(data: bytes, ext: str, sheet: int | str) -> pd.DataFrame:
-    buf = io.BytesIO(data)
     if ext == ".html.xls":  # HTML table dressed up as Excel (needs lxml)
-        tables = pd.read_html(buf)
+        tables = pd.read_html(io.StringIO(_decode(data)))
         if not tables:
             raise BlissError("Results page had no tables.")
         return tables[sheet if isinstance(sheet, int) else 0]
-    return pd.read_excel(buf, sheet_name=sheet)
+    return pd.read_excel(io.BytesIO(data), sheet_name=sheet)
 
 
 # ----------------------------------------------------------------------------- client
+
+
 class BlissClient:
-    """One logged-in BLISS session. Use as a context manager, or open()/close()."""
+    """One logged-in BLISS session. Use as a context manager, or open()/close().
+
+    Example:
+        with BlissClient() as bliss:
+            df = bliss.query("2026-10-01", "2026-10-15")
+
+    Args:
+        user: BLISS username. Default: ``$BLISS_USER`` (env or .env).
+        password: BLISS password. Default: ``$BLISS_PASSWORD`` (env or .env).
+        endpoint: Name in ``ENDPOINTS``, a URL, or a ``BlissEndpoint``.
+            Default: ``$BLISS_HOST``, else ``DEFAULT_ENDPOINT``.
+        debug: Dump every HTTP response to ``debug_dir``.
+        debug_dir: Folder for debug dumps. Default: ``./_debug``.
+        poll_seconds: Wait between job-status polls.
+        timeout_seconds: Give up on a job after this long.
+    """
 
     def __init__(
         self,
@@ -386,6 +450,7 @@ class BlissClient:
         self._n: int = 0  # query counter, keeps debug dumps from overwriting
 
     # -- lifecycle -------------------------------------------------------------
+
     def __enter__(self) -> Self:
         return self.open()
 
@@ -403,20 +468,24 @@ class BlissClient:
 
     @property
     def is_open(self) -> bool:
+        """True while logged in."""
         return self._s is not None
 
     def open(self) -> Self:
+        """Log in if not already logged in. Returns self for chaining."""
         if self._s is None:
             self._s = self._login()
         return self
 
     def close(self) -> None:
+        """End the session. Safe to call more than once."""
         if self._s is not None:
             self._s.close()
             self._s = None
             log.info("BLISS session closed")
 
     # -- public ----------------------------------------------------------------
+
     def query(
         self,
         start: DateLike | None = None,
@@ -433,16 +502,29 @@ class BlissClient:
     ) -> pd.DataFrame:
         """Run one BLISS ad-hoc export and return it as a DataFrame.
 
-        start / end     date, datetime, or string ("2026-10-01"). End is inclusive.
-                        Defaults: end = today, start = end - days_back.
-        days_back       only used when start is None (default 7).
-        unit            BLISS Unit id (default "1000").
-        code            BLISS Code id (default "0").
-        attributes      list of ids [11, 2, 6] or dotted string "11.2.6".
-        key_attributes  same format as attributes.
-        extra_params    any other raw BLISS query params, e.g. {"Lab": "3"}.
-        sheet           sheet index or name to return (default first sheet).
-        save_to         folder to also save the raw file into (optional).
+        Logs in automatically if the client isn't open yet, and logs in again
+        once if the session has expired.
+
+        Args:
+            start: First day (date, datetime, or ``"YYYY-MM-DD"``).
+                Default: ``end - days_back``.
+            end: Last day, inclusive. Default: today.
+            days_back: Only used when ``start`` is None. Default 7.
+            unit: BLISS Unit id. Default ``"1000"``.
+            code: BLISS Code id. Default ``"0"``.
+            attributes: Attribute ids as a list ``[11, 2, 6]`` or dotted
+                string ``"11.2.6"``. Default: ``BASE_PARAMS["Attributes"]``.
+            key_attributes: Same format as ``attributes``.
+            extra_params: Any other raw BLISS query params, e.g. ``{"Lab": "3"}``.
+            sheet: Sheet index or name to return. Default: first sheet.
+            save_to: Folder to also save the raw file into. Default: don't save.
+
+        Returns:
+            The export as a DataFrame.
+
+        Raises:
+            BlissError: Login, export job, or download failed.
+            ValueError: Bad dates.
         """
         self.open()  # lazy login if needed
         start_d, end_d = resolve_dates(start, end, days_back)
@@ -456,7 +538,6 @@ class BlissClient:
             extra_params=extra_params,
         )
         qs = urlencode(params, safe=":,")  # keep ':' and ',' literal like the browser
-
         self._n += 1
         tag = f"{self.endpoint.name}_q{self._n:02d}"
         log.info("BLISS %s: %s -> %s", tag, start_d, end_d)
@@ -481,7 +562,6 @@ class BlissClient:
             )
 
         data, ext = self._fetch(tag)
-
         if save_to is not None:
             out = Path(save_to)
             out.mkdir(parents=True, exist_ok=True)
@@ -491,10 +571,10 @@ class BlissClient:
             )
             path.write_bytes(data)
             log.info("Saved %s bytes -> %s", f"{len(data):,}", path)
-
         return _to_frame(data, ext, sheet)
 
     # -- internals -------------------------------------------------------------
+
     @property
     def _session(self) -> requests.Session:
         if self._s is None:
@@ -534,7 +614,6 @@ class BlissClient:
             s.close()
             raise BlissError("Token64 not found on login page - page layout changed?")
         token64 = m.group(1)
-
         p = _Inputs()
         p.feed(r.text)
         form = p.fields
@@ -664,21 +743,76 @@ class BlissClient:
 
 
 # ----------------------------------------------------------------------------- one-shot
+
+
 def pull(
     start: DateLike | None = None,
     end: DateLike | None = None,
     *,
     endpoint: EndpointLike = None,
+    user: str | None = None,
+    password: str | None = None,
     debug: bool = False,
-    **query_kwargs: Any,
+    days_back: int = DEFAULT_DAYS_BACK,
+    unit: str | int | None = None,
+    code: str | int | None = None,
+    attributes: AttrList | None = None,
+    key_attributes: AttrList | None = None,
+    extra_params: Mapping[str, Any] | None = None,
+    sheet: int | str = 0,
+    save_to: str | Path | None = None,
 ) -> pd.DataFrame:
-    """Login, run one query, close. Same arguments as BlissClient.query()."""
-    with BlissClient(endpoint=endpoint, debug=debug) as bliss:
-        return bliss.query(start, end, **query_kwargs)
+    """Log in, run one query, log out. For several queries use ``BlissClient``.
+
+    Example:
+        df = pull("2026-10-01", "2026-10-15", unit=1200)
+
+    Args:
+        start: First day (date, datetime, or ``"YYYY-MM-DD"``).
+            Default: ``end - days_back``.
+        end: Last day, inclusive. Default: today.
+        endpoint: Name in ``ENDPOINTS``, a URL, or a ``BlissEndpoint``.
+            Default: ``$BLISS_HOST``, else ``DEFAULT_ENDPOINT``.
+        user: BLISS username. Default: ``$BLISS_USER`` (env or .env).
+        password: BLISS password. Default: ``$BLISS_PASSWORD`` (env or .env).
+        debug: Dump every HTTP response to ``./_debug``.
+        days_back: Only used when ``start`` is None. Default 7.
+        unit: BLISS Unit id. Default ``"1000"``.
+        code: BLISS Code id. Default ``"0"``.
+        attributes: Attribute ids as a list ``[11, 2, 6]`` or dotted
+            string ``"11.2.6"``.
+        key_attributes: Same format as ``attributes``.
+        extra_params: Any other raw BLISS query params, e.g. ``{"Lab": "3"}``.
+        sheet: Sheet index or name to return. Default: first sheet.
+        save_to: Folder to also save the raw file into. Default: don't save.
+
+    Returns:
+        The export as a DataFrame.
+
+    Raises:
+        BlissError: Login, export job, or download failed.
+        ValueError: Bad dates or unknown endpoint.
+    """
+    with BlissClient(user, password, endpoint=endpoint, debug=debug) as bliss:
+        return bliss.query(
+            start,
+            end,
+            days_back=days_back,
+            unit=unit,
+            code=code,
+            attributes=attributes,
+            key_attributes=key_attributes,
+            extra_params=extra_params,
+            sheet=sheet,
+            save_to=save_to,
+        )
 
 
 # ----------------------------------------------------------------------------- CLI
+
+
 def main() -> None:
+    """Entry point for the ``bliss-pull`` command."""
     ap = argparse.ArgumentParser(prog="bliss-pull", description="Pull BLISS lab data.")
     ap.add_argument(
         "--endpoint",
